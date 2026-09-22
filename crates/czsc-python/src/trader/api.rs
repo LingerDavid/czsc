@@ -1516,8 +1516,9 @@ pub fn get_unique_signals(
     }
 
     // 复用 generate_czsc_signals 的产出（list[dict]）。设置 df=false 以避免来回 DataFrame 转换。
-    let records =
-        super::generate::generate_czsc_signals(py, bars, signals_config, sdt, init_n, false)?;
+    let records = super::generate::generate_czsc_signals(
+        py, bars, signals_config, sdt, init_n, false, false, false,
+    )?;
     let bound_records = records.bind(py);
     let list = bound_records
         .cast::<PyList>()

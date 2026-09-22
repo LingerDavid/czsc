@@ -50,6 +50,10 @@ pub struct TaCache {
     /// series 对应的 bar id 序列（用于 bars_raw 截断后对齐）
     pub series_ids: HashMap<String, Vec<i32>>,
 
+    /// `bars_raw` 的 id→下标增量索引（append/同 dt 更新 O(1)，截断时重建）
+    #[serde(default)]
+    pub bar_index: HashMap<i32, usize>,
+
     /// 标记已缓存的最大长度，用于增量判断
     pub last_len: usize,
 }

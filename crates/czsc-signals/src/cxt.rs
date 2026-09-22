@@ -7,8 +7,7 @@ use crate::utils::cxt::{
 };
 use crate::utils::math::{linreg_predict, max_amplitude_pct, mean, overlap};
 use crate::utils::sig::{
-    bar_index_map, get_sub_elements, get_usize_param, make_kline_signal_v1, make_kline_signal_v2,
-    qcut_last_label,
+    get_sub_elements, get_usize_param, make_kline_signal_v1, make_kline_signal_v2, qcut_last_label,
 };
 use crate::utils::ta::{
     ma_snapshot_value, macd_snapshot_field_value, update_ma_cache, update_macd_cache, MacdField,
@@ -280,7 +279,7 @@ pub fn cxt_bi_end_v230104(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
     let Some(ma) = cache.series.get(&cache_key) else {
         return make_kline_signal_v1(&k1, &k2, k3, v1);
     };
-    let id_to_idx = bar_index_map(c);
+    let id_to_idx = &cache.bar_index;
     let bar1 = &bars[0];
     let bar2 = &bars[1];
     let bar3 = &bars[2];
@@ -357,7 +356,7 @@ pub fn cxt_bi_end_v230105(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
     let Some(ma) = cache.series.get(&cache_key) else {
         return make_kline_signal_v1(&k1, &k2, k3, v1);
     };
-    let id_to_idx = bar_index_map(c);
+    let id_to_idx = &cache.bar_index;
     let last_bi = c.bi_list.last().unwrap();
     let fx_raw = fx_raw_bars(&last_bi.fx_b);
     if fx_raw.len() < 2 {
@@ -500,7 +499,7 @@ pub fn cxt_bi_end_v230312(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
     let Some(macd) = cache.macd.get(&cache_key) else {
         return make_kline_signal_v1(&k1, &k2, k3, v1);
     };
-    let id_to_idx = bar_index_map(c);
+    let id_to_idx = &cache.bar_index;
     let mut snapshot_overrides: HashMap<i32, (f64, f64, f64)> = HashMap::new();
     let macd1 = macd_snapshot_field_value(
         c,
@@ -583,7 +582,7 @@ pub fn cxt_bi_end_v230324(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
     let Some(ma) = cache.series.get(&cache_key) else {
         return make_kline_signal_v1(&k1, &k2, k3, v1);
     };
-    let id_to_idx = bar_index_map(c);
+    let id_to_idx = &cache.bar_index;
     let last_bi = c.bi_list.last().unwrap();
     let fx_raw = fx_raw_bars(&last_bi.fx_b);
     if fx_raw.len() < 2 {
@@ -870,7 +869,7 @@ pub fn cxt_second_bs_v230320(c: &CZSC, params: &ParamView, cache: &mut TaCache) 
     let Some(ma) = cache.series.get(&cache_key) else {
         return make_kline_signal_v1(&k1, &k2, k3, v1);
     };
-    let id_to_idx = bar_index_map(c);
+    let id_to_idx = &cache.bar_index;
 
     let get_ma = |bar_id: i32| -> Option<f64> {
         let idx = *id_to_idx.get(&bar_id)?;
@@ -956,7 +955,7 @@ pub fn cxt_third_bs_v230318(c: &CZSC, params: &ParamView, cache: &mut TaCache) -
     let Some(ma) = cache.series.get(&cache_key) else {
         return make_kline_signal_v1(&k1, &k2, k3, v1);
     };
-    let id_to_idx = bar_index_map(c);
+    let id_to_idx = &cache.bar_index;
     let b1_fx = fx_raw_bars(&b1.fx_b);
     let b3_fx = fx_raw_bars(&b3.fx_b);
     let b5_fx = fx_raw_bars(&b5.fx_b);
@@ -1811,7 +1810,7 @@ pub fn cxt_third_bs_v230319(c: &CZSC, params: &ParamView, cache: &mut TaCache) -
     let Some(ma) = cache.series.get(&cache_key) else {
         return make_kline_signal_v1(&k1, &k2, k3, "其他");
     };
-    let id_to_idx = bar_index_map(c);
+    let id_to_idx = &cache.bar_index;
     let mut snapshot_overrides: HashMap<i32, f64> = HashMap::new();
     let get_last_ma = |bi: &BI, snapshot_overrides: &mut HashMap<i32, f64>| -> Option<f64> {
         let rb = fx_raw_bars(&bi.fx_b);
@@ -1954,7 +1953,7 @@ pub fn cxt_bi_end_v230322(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
     let Some(ma) = cache.series.get(&cache_key) else {
         return make_kline_signal_v1(&k1, &k2, k3, "其他");
     };
-    let id_to_idx = bar_index_map(c);
+    let id_to_idx = &cache.bar_index;
     let last_bi = c.bi_list.last().unwrap();
     let last_fx = ubi_fxs.last().unwrap();
     let last_fx_raw = fx_raw_bars(last_fx);

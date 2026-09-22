@@ -1,4 +1,5 @@
 use crate::params::ParamView;
+use crate::types::TaCache;
 use chrono::{Datelike, Duration, Timelike};
 use czsc_core::analyze::CZSC;
 use czsc_core::objects::bar::RawBar;
@@ -57,6 +58,45 @@ pub fn bar_index_map(czsc: &CZSC) -> HashMap<i32, usize> {
         .enumerate()
         .map(|(i, b)| (b.id, i))
         .collect()
+}
+
+/// 将 `cache.bar_index` 与当前 `czsc.bars_raw` 对齐。
+///
+/// - 纯追加一根：O(1) insert
+/// - 同 dt 延伸（len/首尾 id 不变）：直接复用
+/// - 前缀截断或其它结构变化：O(n) 重建
+pub fn sync_bar_index(czsc: &CZSC, cache: &mut TaCache) {
+    let bars = &czsc.bars_raw;
+    let n = bars.len();
+    if n == 0 {
+        cache.bar_index.clear();
+        return;
+    }
+    let first_id = bars[0].id;
+    let last_id = bars[n - 1].id;
+
+    if cache.bar_index.len() == n
+        && cache.bar_index.get(&first_id) == Some(&0)
+        && cache.bar_index.get(&last_id) == Some(&(n - 1))
+    {
+        return;
+    }
+
+    if cache.bar_index.len() + 1 == n
+        && n >= 2
+        && cache.bar_index.get(&first_id) == Some(&0)
+        && cache.bar_index.get(&bars[n - 2].id) == Some(&(n - 2))
+        && !cache.bar_index.contains_key(&last_id)
+    {
+        cache.bar_index.insert(last_id, n - 1);
+        return;
+    }
+
+    cache.bar_index.clear();
+    cache.bar_index.reserve(n);
+    for (i, b) in bars.iter().enumerate() {
+        cache.bar_index.insert(b.id, i);
+    }
 }
 
 /// 构建 `bar.id -> 最新 RawBar` 映射，用于在信号层对齐 Python 的“按当前 bars_raw 读取”语义。

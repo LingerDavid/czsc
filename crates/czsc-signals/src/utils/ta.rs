@@ -1,4 +1,5 @@
 use crate::types::{BollSeries, KdjSeries, MacdSeries, TaCache};
+use crate::utils::sig::sync_bar_index;
 use czsc_core::analyze::CZSC;
 use czsc_core::objects::bar::RawBar;
 use std::collections::HashMap;
@@ -136,21 +137,68 @@ pub fn ma_snapshot_value(
     if (current_close - raw_bar.close).abs() <= f64::EPSILON {
         return Some(base);
     }
-
     if let Some(value) = snapshot_overrides.get(&raw_bar.id) {
         return Some(*value);
     }
 
-    let mut close: Vec<f64> = czsc.bars_raw.iter().map(|b| b.close).collect();
-    close[idx] = raw_bar.close;
-    let snapshot = match ma_type.to_uppercase().as_str() {
-        "EMA" => calc_ema_cache_style(&close, timeperiod),
-        "WMA" => calc_wma_cache_style(&close, timeperiod),
-        _ => calc_sma_cache_style(&close, timeperiod),
+    // SMA/WMA 只依赖局部窗口；EMA 依赖 0..=idx 前缀 —— 避免每次全长重算。
+    let value = match ma_type.to_uppercase().as_str() {
+        "EMA" => {
+            let mut close: Vec<f64> = czsc.bars_raw[..=idx].iter().map(|b| b.close).collect();
+            close[idx] = raw_bar.close;
+            *calc_ema_cache_style(&close, timeperiod).last()?
+        }
+        "WMA" => ma_snapshot_window_at(czsc, idx, raw_bar.close, timeperiod, true)?,
+        _ => ma_snapshot_window_at(czsc, idx, raw_bar.close, timeperiod, false)?,
     };
-    let value = *snapshot.get(idx)?;
     snapshot_overrides.insert(raw_bar.id, value);
     Some(value)
+}
+
+/// SMA/WMA(cache-style) 在 idx 的值只依赖 `close[idx+1-n ..= idx]`。
+fn ma_snapshot_window_at(
+    czsc: &CZSC,
+    idx: usize,
+    snapshot_close: f64,
+    n: usize,
+    weighted: bool,
+) -> Option<f64> {
+    if n == 0 || idx + 1 < n {
+        return Some(f64::NAN);
+    }
+    let start = idx + 1 - n;
+    if weighted {
+        let denom = (n * (n + 1) / 2) as f64;
+        let mut acc = 0.0;
+        for (w, i) in (start..=idx).enumerate() {
+            let c = if i == idx {
+                snapshot_close
+            } else {
+                czsc.bars_raw.get(i)?.close
+            };
+            acc += c * (w + 1) as f64;
+        }
+        Some(acc / denom)
+    } else {
+        let mut sum = 0.0;
+        for i in start..=idx {
+            let c = if i == idx {
+                snapshot_close
+            } else {
+                czsc.bars_raw.get(i)?.close
+            };
+            sum += c;
+        }
+        Some(sum / n as f64)
+    }
+}
+
+fn calc_ma_cache_style(close: &[f64], ma_type: &str, timeperiod: usize) -> Vec<f64> {
+    match ma_type {
+        "EMA" => calc_ema_cache_style(close, timeperiod),
+        "WMA" => calc_wma_cache_style(close, timeperiod),
+        _ => calc_sma_cache_style(close, timeperiod),
+    }
 }
 
 /// 计算简单移动平均线 (SMA)，对齐 Python `czsc.utils.ta.SMA`
@@ -389,7 +437,7 @@ pub fn calc_cci(high: &[f64], low: &[f64], close: &[f64], timeperiod: usize) -> 
     out
 }
 
-/// 更新 MA 缓存
+/// 更新 MA 缓存（append / 同 dt 刷新尾部 O(window)；结构变化才全量重算）。
 pub fn update_ma_cache(
     czsc: &CZSC,
     cache_key: &str,
@@ -401,66 +449,74 @@ pub fn update_ma_cache(
     if now_len == 0 {
         return;
     }
+    sync_bar_index(czsc, cache);
+
     let ma_type_u = ma_type.to_uppercase();
-    let bar_ids: Vec<i32> = czsc.bars_raw.iter().map(|b| b.id).collect();
+    let bars = &czsc.bars_raw;
+    let first_id = bars[0].id;
+    let last_id = bars[now_len - 1].id;
 
-    let mut need_init = !cache.series.contains_key(cache_key) || now_len < timeperiod + 15;
-    if !need_init {
-        if let Some(existing_ids) = cache.series_ids.get(cache_key) {
-            if now_len < 2 || existing_ids.is_empty() {
-                need_init = true;
-            } else {
-                let penultimate_id = bar_ids[now_len - 2];
-                need_init = !existing_ids.contains(&penultimate_id);
-            }
-        } else {
-            need_init = true;
+    // 先判定模式并释放对 cache 的共享借用，再做可变更新。
+    let (append, refresh_last) = match (
+        cache.series.get(cache_key),
+        cache.series_ids.get(cache_key),
+    ) {
+        (Some(series), Some(ids))
+            if !ids.is_empty()
+                && series.len() == ids.len()
+                && ids.first() == Some(&first_id)
+                && now_len >= timeperiod.saturating_add(15) =>
+        {
+            let append =
+                ids.len() + 1 == now_len && ids.last() == Some(&bars[now_len - 2].id);
+            let refresh_last = ids.len() == now_len && ids.last() == Some(&last_id);
+            (append, refresh_last)
         }
-    }
-
-    let calc = |close: &[f64]| match ma_type_u.as_str() {
-        "SMA" => calc_sma_cache_style(close, timeperiod),
-        "EMA" => calc_ema_cache_style(close, timeperiod),
-        "WMA" => calc_wma_cache_style(close, timeperiod),
-        _ => calc_sma_cache_style(close, timeperiod),
+        _ => (false, false),
     };
 
-    if need_init {
-        let close: Vec<f64> = czsc.bars_raw.iter().map(|b| b.close).collect();
-        let res = calc(&close);
+    if append {
+        cache.series_ids.get_mut(cache_key).unwrap().push(last_id);
+        cache.series.get_mut(cache_key).unwrap().push(f64::NAN);
+        refresh_ma_tail(czsc, cache, cache_key, &ma_type_u, timeperiod, 5);
+    } else if refresh_last {
+        refresh_ma_tail(czsc, cache, cache_key, &ma_type_u, timeperiod, 5);
+    } else {
+        let bar_ids: Vec<i32> = bars.iter().map(|b| b.id).collect();
+        let close: Vec<f64> = bars.iter().map(|b| b.close).collect();
+        let res = calc_ma_cache_style(&close, &ma_type_u, timeperiod);
         cache.series.insert(cache_key.to_string(), res);
         cache.series_ids.insert(cache_key.to_string(), bar_ids);
-        cache.last_len = now_len;
+    }
+    cache.last_len = now_len;
+}
+
+/// 用尾部窗口重算最近 `tail` 个 MA 值（与历史增量路径一致；EMA 短窗近似同旧实现）。
+fn refresh_ma_tail(
+    czsc: &CZSC,
+    cache: &mut TaCache,
+    cache_key: &str,
+    ma_type: &str,
+    timeperiod: usize,
+    tail: usize,
+) {
+    let now_len = czsc.bars_raw.len();
+    let Some(series) = cache.series.get_mut(cache_key) else {
+        return;
+    };
+    if series.len() != now_len || now_len == 0 {
         return;
     }
-
-    let existing = cache.series.get(cache_key).unwrap();
-    let existing_ids = cache.series_ids.get(cache_key).unwrap();
-    let mut old_map: HashMap<i32, f64> = HashMap::with_capacity(existing_ids.len());
-    for (i, id) in existing_ids.iter().enumerate() {
-        old_map.insert(*id, existing[i]);
-    }
-    let mut res = Vec::with_capacity(now_len);
-    for id in &bar_ids {
-        res.push(*old_map.get(id).unwrap_or(&f64::NAN));
-    }
-
     let window_size = (timeperiod + 10).min(now_len);
     let window_start = now_len - window_size;
     let close: Vec<f64> = czsc.bars_raw[window_start..]
         .iter()
         .map(|b| b.close)
         .collect();
-    let partial = calc(&close);
-    for i in 1..=5.min(window_size) {
-        let dst_idx = now_len - i;
-        let src_idx = window_size - i;
-        res[dst_idx] = partial[src_idx];
+    let partial = calc_ma_cache_style(&close, ma_type, timeperiod);
+    for i in 1..=tail.min(window_size) {
+        series[now_len - i] = partial[window_size - i];
     }
-
-    cache.series.insert(cache_key.to_string(), res);
-    cache.series_ids.insert(cache_key.to_string(), bar_ids);
-    cache.last_len = now_len;
 }
 
 /// 更新成交量 MA 缓存（对齐 Python `update_vol_ma_cache` 增量语义）
@@ -550,6 +606,7 @@ pub fn update_macd_cache(
     if now_len == 0 {
         return;
     }
+    sync_bar_index(czsc, cache);
     let bar_ids: Vec<i32> = czsc.bars_raw.iter().map(|b| b.id).collect();
     let min_count = m + long + 168;
 
@@ -1393,7 +1450,7 @@ fn calc_stoch(
 mod tests {
     use super::{
         calc_ema, calc_macd, calc_macd_cache_style, calc_macd_py_style, calc_rsi, calc_sma,
-        calc_stoch, calc_wma,
+        calc_sma_cache_style, calc_stoch, calc_wma, ma_snapshot_value, update_ma_cache,
     };
 
     #[test]
@@ -1658,5 +1715,122 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_update_ma_cache_append_matches_full_recompute() {
+        use crate::types::TaCache;
+        use chrono::TimeZone;
+        use czsc_core::analyze::CZSC;
+        use czsc_core::objects::bar::RawBarBuilder;
+        use czsc_core::objects::freq::Freq;
+
+        let make = |id: i32, close: f64| {
+            RawBarBuilder::default()
+                .symbol("T")
+                .id(id)
+                .dt(chrono::Utc
+                    .with_ymd_and_hms(2024, 1, 1, 9, 30, 0)
+                    .unwrap()
+                    + chrono::Duration::minutes(id as i64))
+                .freq(Freq::F1)
+                .open(close)
+                .close(close)
+                .high(close)
+                .low(close)
+                .vol(1.0)
+                .amount(close)
+                .build()
+                .unwrap()
+        };
+
+        let mut bars: Vec<_> = (0..80).map(|i| make(i, 100.0 + (i as f64) * 0.1)).collect();
+        let mut czsc = CZSC::new(bars.clone(), 50, 6);
+        let mut cache = TaCache::default();
+        let key = "SMA#5";
+        update_ma_cache(&czsc, key, "SMA", 5, &mut cache);
+
+        for i in 80..120 {
+            let bar = make(i, 100.0 + (i as f64) * 0.1);
+            bars.push(bar.clone());
+            czsc.update_bar(bar);
+            update_ma_cache(&czsc, key, "SMA", 5, &mut cache);
+        }
+
+        let closes: Vec<f64> = czsc.bars_raw.iter().map(|b| b.close).collect();
+        let expect = calc_sma_cache_style(&closes, 5);
+        let got = cache.series.get(key).unwrap();
+        assert_eq!(got.len(), expect.len());
+        for i in 0..got.len() {
+            if expect[i].is_nan() {
+                assert!(got[i].is_nan(), "idx {i}");
+            } else {
+                assert!(
+                    (got[i] - expect[i]).abs() < 1e-12,
+                    "idx {i}: got {} expect {}",
+                    got[i],
+                    expect[i]
+                );
+            }
+        }
+        assert_eq!(cache.bar_index.len(), czsc.bars_raw.len());
+    }
+
+    #[test]
+    fn test_ma_snapshot_sma_local_matches_full_recalc() {
+        use chrono::TimeZone;
+        use czsc_core::analyze::CZSC;
+        use czsc_core::objects::bar::RawBarBuilder;
+        use czsc_core::objects::freq::Freq;
+        use std::collections::HashMap;
+
+        let make = |id: i32, close: f64| {
+            RawBarBuilder::default()
+                .symbol("T")
+                .id(id)
+                .dt(chrono::Utc
+                    .with_ymd_and_hms(2024, 1, 1, 9, 30, 0)
+                    .unwrap()
+                    + chrono::Duration::minutes(id as i64))
+                .freq(Freq::F1)
+                .open(close)
+                .close(close)
+                .high(close)
+                .low(close)
+                .vol(1.0)
+                .amount(close)
+                .build()
+                .unwrap()
+        };
+        let bars: Vec<_> = (0..60).map(|i| make(i, 50.0 + i as f64)).collect();
+        let czsc = CZSC::new(bars, 50, 6);
+        let closes: Vec<f64> = czsc.bars_raw.iter().map(|b| b.close).collect();
+        let series = calc_sma_cache_style(&closes, 5);
+        let id_to_idx: HashMap<i32, usize> = czsc
+            .bars_raw
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.id, i))
+            .collect();
+
+        let idx = 40usize;
+        let mut snap = czsc.bars_raw[idx].clone();
+        snap.close = snap.close + 3.5;
+        let mut overrides = HashMap::new();
+        let got = ma_snapshot_value(
+            &czsc,
+            &series,
+            &id_to_idx,
+            &snap,
+            "SMA",
+            5,
+            &mut overrides,
+        )
+        .unwrap();
+
+        let mut full_close = closes.clone();
+        full_close[idx] = snap.close;
+        let full = calc_sma_cache_style(&full_close, 5);
+        assert!((got - full[idx]).abs() < 1e-12);
     }
 }
